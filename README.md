@@ -311,4 +311,6 @@ This repository is built upon [rsl_rl](https://github.com/leggedrobotics/rsl_rl)
 
 ## License
 
+This project is licensed under the **BSD-3-Clause License** - see the [LICENSE](LICENSE) file for details.
+
 See [licenses/](licenses/) directory for dependency licenses.
