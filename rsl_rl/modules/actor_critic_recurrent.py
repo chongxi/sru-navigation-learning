@@ -189,6 +189,132 @@ class ActorCriticRecurrent(ActorCritic):
         scripted.save(filepath)
         print(f"[ActorCriticRecurrent] Exported JIT policy ({rnn_type}) to: {filepath}")
 
+    def export_onnx(self, path: str, filename: str = "policy.onnx", normalizer=None, num_obs: int = None):
+        """Export policy as an ONNX model for inference.
+
+        Supports LSTM, GRU, and LSTM_SRU RNN types. For recurrent networks, hidden states
+        are exposed as explicit inputs and outputs since ONNX doesn't support stateful ops.
+
+        The ONNX model has the following interface:
+            Inputs:
+                - obs: Observation tensor of shape (1, num_obs)
+                - h_in: Hidden state tensor of shape (num_layers, 1, hidden_size)
+                - c_in: Cell state tensor of shape (num_layers, 1, hidden_size) [LSTM/LSTM_SRU only]
+            Outputs:
+                - actions: Action tensor of shape (1, num_actions)
+                - h_out: Updated hidden state
+                - c_out: Updated cell state [LSTM/LSTM_SRU only]
+
+        Args:
+            path: Directory path to save the exported model.
+            filename: Name of the exported file. Defaults to "policy.onnx".
+            normalizer: Optional normalizer module for observations.
+            num_obs: Number of observations (inferred from memory if not provided).
+        """
+        import os
+
+        rnn = self.memory_a.rnn
+        rnn_type = type(rnn).__name__.lower()
+
+        # Infer num_obs from RNN input size if not provided
+        if num_obs is None:
+            num_obs = rnn.input_size
+
+        # Create appropriate ONNX exporter based on RNN type
+        # Note: Input/output names follow deployment convention: h_in/h_out, c_in/c_out
+        if rnn_type == "lstm":
+            exporter = _LSTMPolicyONNXExporter(
+                actor=self.actor,
+                rnn=rnn,
+                linear_dropout=self.linear_dropout_actor,
+                normalizer=normalizer,
+            )
+            input_names = ["obs", "h_in", "c_in"]
+            output_names = ["actions", "h_out", "c_out"]
+            # Create dummy inputs for LSTM (obs, hidden, cell)
+            dummy_obs = torch.zeros(1, num_obs)
+            dummy_hidden = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+            dummy_cell = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+            dummy_inputs = (dummy_obs, dummy_hidden, dummy_cell)
+            dynamic_axes = {
+                "obs": {0: "batch_size"},
+                "h_in": {1: "batch_size"},
+                "c_in": {1: "batch_size"},
+                "actions": {0: "batch_size"},
+                "h_out": {1: "batch_size"},
+                "c_out": {1: "batch_size"},
+            }
+        elif rnn_type == "gru":
+            exporter = _GRUPolicyONNXExporter(
+                actor=self.actor,
+                rnn=rnn,
+                linear_dropout=self.linear_dropout_actor,
+                normalizer=normalizer,
+            )
+            input_names = ["obs", "h_in"]
+            output_names = ["actions", "h_out"]
+            # Create dummy inputs for GRU (obs, hidden)
+            dummy_obs = torch.zeros(1, num_obs)
+            dummy_hidden = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+            dummy_inputs = (dummy_obs, dummy_hidden)
+            dynamic_axes = {
+                "obs": {0: "batch_size"},
+                "h_in": {1: "batch_size"},
+                "actions": {0: "batch_size"},
+                "h_out": {1: "batch_size"},
+            }
+        elif rnn_type == "lstm_sru":
+            exporter = _LSTMSRUPolicyONNXExporter(
+                actor=self.actor,
+                rnn=rnn,
+                linear_dropout=self.linear_dropout_actor,
+                normalizer=normalizer,
+            )
+            input_names = ["obs", "h_in", "c_in"]
+            output_names = ["actions", "h_out", "c_out"]
+            # Create dummy inputs for LSTM_SRU (obs, hidden, cell)
+            dummy_obs = torch.zeros(1, num_obs)
+            dummy_hidden = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+            dummy_cell = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+            dummy_inputs = (dummy_obs, dummy_hidden, dummy_cell)
+            dynamic_axes = {
+                "obs": {0: "batch_size"},
+                "h_in": {1: "batch_size"},
+                "c_in": {1: "batch_size"},
+                "actions": {0: "batch_size"},
+                "h_out": {1: "batch_size"},
+                "c_out": {1: "batch_size"},
+            }
+        else:
+            raise NotImplementedError(f"Unsupported RNN type for ONNX export: {rnn_type}")
+
+        exporter.eval()
+        exporter.to("cpu")
+
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+
+        # Export to ONNX
+        torch.onnx.export(
+            exporter,
+            dummy_inputs,
+            filepath,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=17,
+            do_constant_folding=True,
+        )
+        print(f"[ActorCriticRecurrent] Exported ONNX policy ({rnn_type}) to: {filepath}")
+
+        # Print model info for deployment
+        print(f"  - Input 'obs': shape (1, {num_obs})")
+        print(f"  - Input 'h_in': shape ({rnn.num_layers}, 1, {rnn.hidden_size})")
+        if rnn_type in ("lstm", "lstm_sru"):
+            print(f"  - Input 'c_in': shape ({rnn.num_layers}, 1, {rnn.hidden_size})")
+        print(f"  - Output 'actions', 'h_out'" + (", 'c_out'" if rnn_type in ("lstm", "lstm_sru") else ""))
+        print(f"  - Note: Initialize h_in/c_in to zeros at episode start")
+
 
 class _LSTMPolicyExporter(nn.Module):
     """JIT-exportable wrapper for ActorCriticRecurrent with LSTM (optimized)."""
@@ -286,6 +412,117 @@ class _LSTMSRUPolicyExporter(nn.Module):
     def reset(self):
         self.hidden_state.zero_()
         self.cell_state.zero_()
+
+
+# =============================================================================
+# ONNX Policy Exporters
+# =============================================================================
+# These exporters are designed for ONNX export where hidden states must be
+# explicit inputs/outputs (ONNX doesn't support stateful operations).
+
+
+class _LSTMPolicyONNXExporter(nn.Module):
+    """ONNX-exportable wrapper for ActorCriticRecurrent with LSTM.
+
+    Unlike JIT exporters, ONNX requires hidden states as explicit I/O.
+    """
+
+    def __init__(self, actor, rnn, linear_dropout, normalizer=None):
+        super().__init__()
+        import copy
+        self.actor = copy.deepcopy(actor)
+        self.rnn = copy.deepcopy(rnn)
+        self.linear = copy.deepcopy(linear_dropout.linear)
+        self.activation = copy.deepcopy(linear_dropout.activation)
+        self.normalizer = copy.deepcopy(normalizer) if normalizer else nn.Identity()
+
+    def forward(
+        self, obs: torch.Tensor, hidden_state: torch.Tensor, cell_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass with explicit hidden state I/O.
+
+        Args:
+            obs: Observation tensor of shape (batch, num_obs)
+            hidden_state: LSTM hidden state of shape (num_layers, batch, hidden_size)
+            cell_state: LSTM cell state of shape (num_layers, batch, hidden_size)
+
+        Returns:
+            Tuple of (actions, new_hidden_state, new_cell_state)
+        """
+        x = self.normalizer(obs)
+        x, (h_out, c_out) = self.rnn(x.unsqueeze(0), (hidden_state, cell_state))
+        x = self.activation(self.linear(x.squeeze(0)))
+        actions = self.actor(x)
+        return actions, h_out, c_out
+
+
+class _GRUPolicyONNXExporter(nn.Module):
+    """ONNX-exportable wrapper for ActorCriticRecurrent with GRU.
+
+    Unlike JIT exporters, ONNX requires hidden states as explicit I/O.
+    """
+
+    def __init__(self, actor, rnn, linear_dropout, normalizer=None):
+        super().__init__()
+        import copy
+        self.actor = copy.deepcopy(actor)
+        self.rnn = copy.deepcopy(rnn)
+        self.linear = copy.deepcopy(linear_dropout.linear)
+        self.activation = copy.deepcopy(linear_dropout.activation)
+        self.normalizer = copy.deepcopy(normalizer) if normalizer else nn.Identity()
+
+    def forward(
+        self, obs: torch.Tensor, hidden_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with explicit hidden state I/O.
+
+        Args:
+            obs: Observation tensor of shape (batch, num_obs)
+            hidden_state: GRU hidden state of shape (num_layers, batch, hidden_size)
+
+        Returns:
+            Tuple of (actions, new_hidden_state)
+        """
+        x = self.normalizer(obs)
+        x, h_out = self.rnn(x.unsqueeze(0), hidden_state)
+        x = self.activation(self.linear(x.squeeze(0)))
+        actions = self.actor(x)
+        return actions, h_out
+
+
+class _LSTMSRUPolicyONNXExporter(nn.Module):
+    """ONNX-exportable wrapper for ActorCriticRecurrent with LSTM_SRU.
+
+    Unlike JIT exporters, ONNX requires hidden states as explicit I/O.
+    """
+
+    def __init__(self, actor, rnn, linear_dropout, normalizer=None):
+        super().__init__()
+        import copy
+        self.actor = copy.deepcopy(actor)
+        self.rnn = copy.deepcopy(rnn)
+        self.linear = copy.deepcopy(linear_dropout.linear)
+        self.activation = copy.deepcopy(linear_dropout.activation)
+        self.normalizer = copy.deepcopy(normalizer) if normalizer else nn.Identity()
+
+    def forward(
+        self, obs: torch.Tensor, hidden_state: torch.Tensor, cell_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass with explicit hidden state I/O.
+
+        Args:
+            obs: Observation tensor of shape (batch, num_obs)
+            hidden_state: LSTM_SRU hidden state of shape (num_layers, batch, hidden_size)
+            cell_state: LSTM_SRU cell state of shape (num_layers, batch, hidden_size)
+
+        Returns:
+            Tuple of (actions, new_hidden_state, new_cell_state)
+        """
+        x = self.normalizer(obs)
+        x, (h_out, c_out) = self.rnn(x.unsqueeze(0), (hidden_state, cell_state))
+        x = self.activation(self.linear(x.squeeze(0)))
+        actions = self.actor(x)
+        return actions, h_out, c_out
 
 
 class Memory(torch.nn.Module):
