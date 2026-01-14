@@ -56,8 +56,8 @@ class ActorCriticRecurrent(ActorCritic):
             )
 
         super().__init__(
-            num_actor_obs=rnn_hidden_size,
-            num_critic_obs=rnn_hidden_size,
+            num_actor_obs=actor_hidden_dims[0],
+            num_critic_obs=critic_hidden_dims[0],
             num_actions=num_actions,
             actor_hidden_dims=actor_hidden_dims,
             critic_hidden_dims=critic_hidden_dims,
