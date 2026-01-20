@@ -18,7 +18,7 @@ import rsl_rl
 from rsl_rl.algorithms import MDPO, PPO, SPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticSRU, EmpiricalNormalization
-from rsl_rl.utils import store_code_state
+from rsl_rl.utils import store_code_state, VideoRecorder
 
 
 class OnPolicyRunner:
@@ -34,6 +34,10 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+
+        # Video recording (initialized lazily, enabled via set_video_recording)
+        self.video_recorder: VideoRecorder | None = None
+
         obs, extras = self.env.get_observations()
         num_obs = obs.shape[1]
         if "critic" in extras["observations"]:
@@ -139,13 +143,28 @@ class OnPolicyRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+
         for it in range(start_iter, tot_iter):
             start = time.time()
+
+            # Check if we should start recording video this iteration
+            if self.video_recorder:
+                # Debug: print every 100 iterations to track progress
+                if it % 100 == 0:
+                    print(f"[DEBUG VideoRecorder] Iteration {it}, checking should_record...")
+                if self.video_recorder.should_record(it):
+                    self.video_recorder.start_recording()
+
             # Rollout
             with torch.no_grad():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     obs, rewards, dones, infos = self.env.step(actions)
+
+                    # Capture video frame if recording
+                    # Continue capturing until video_length is reached
+                    if self.video_recorder and self.video_recorder.is_recording:
+                        self.video_recorder.capture_frame()
 
                     # Apply reward shifting for MDPO
                     if self.is_mdpo and reward_shifting_value != 0.0:
@@ -210,6 +229,11 @@ class OnPolicyRunner:
 
             if self.log_dir is not None:
                 self.log(locals())
+
+                # Log video only if recording is complete (reached video_length frames)
+                if self.video_recorder and self.video_recorder.is_recording and self.video_recorder.is_complete():
+                    self.video_recorder.log_video(self.writer, it, self.logger_type)
+
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
             ep_infos.clear()
@@ -404,3 +428,37 @@ class OnPolicyRunner:
     def add_git_repo_to_log(self, repo_file_path):
         """Add a git repository to track for logging."""
         self.git_status_repos.append(repo_file_path)
+
+    def set_video_recording(
+        self, enable: bool, video_length: int = 200, video_interval: int = 2000, fps: int = 30, save_local: bool = True
+    ):
+        """Configure video recording during training.
+
+        Video recording can upload to WandB and/or save locally as MP4 files.
+
+        Requirements:
+        1. Environment with render_mode="rgb_array"
+        2. For WandB upload: logger="wandb" in agent config
+        3. For local save: imageio package installed
+
+        Args:
+            enable: Whether to enable video recording.
+            video_length: Number of environment steps per video. Defaults to 200.
+            video_interval: Number of training iterations between video recordings. Defaults to 2000.
+            fps: Frames per second for the recorded video. Defaults to 30.
+            save_local: Whether to save videos locally as MP4 files. Defaults to True.
+        """
+        if enable:
+            self.video_recorder = VideoRecorder(
+                env=self.env,
+                video_length=video_length,
+                video_interval=video_interval,
+                fps=fps,
+                save_local=save_local,
+                log_dir=self.log_dir,
+            )
+            self.video_recorder.enable()
+        else:
+            if self.video_recorder:
+                self.video_recorder.disable()
+            self.video_recorder = None

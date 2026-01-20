@@ -55,14 +55,14 @@ class ActorCriticSRU(nn.Module):
         critic_hidden_dims: Optional[list[int]] = None,
         activation: str = "elu",
         init_noise_std: float = 1.0,
-        image_input_dims: tuple[int, int, int] = (64, 4, 7),
+        image_input_dims: tuple[int, int, int] = (64, 5, 8),
         height_input_dims: tuple[int, int, int] = (64, 7, 7),
         rnn_type: str = "lstm_sru",
         dropout: float = 0.2,
         rnn_hidden_size: int = 256,
         rnn_num_layers: int = 1,
         time_embed_dim: int = 8,
-        num_cameras: int = 2,
+        num_cameras: int = 1,
         **kwargs,
     ):
         if kwargs:
@@ -106,20 +106,24 @@ class ActorCriticSRU(nn.Module):
         )
 
         # Attention modules (applied in batch, outside RNN loop)
+        # spatial_dims = (D, H, W) where D=num_cameras for image, D=1 for height
         self.attn_image_net = CrossAttentionFuseModule(
             image_dim=image_input_dims[0],
             info_dim=self.actor_proprioceptive_input_dim,
             num_heads=4,
+            spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
         )
         self.attn_height_net = CrossAttentionFuseModule(
             image_dim=height_input_dims[0],
             info_dim=self.critic_proprioceptive_input_dim,
             num_heads=4,
+            spatial_dims=(1, height_input_dims[1], height_input_dims[2]),
         )
         self.attn_critic_image_net = CrossAttentionFuseModule(
             image_dim=image_input_dims[0],
             info_dim=self.critic_proprioceptive_input_dim,
             num_heads=4,
+            spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
         )
 
         # RNN memory modules (plain LSTM_SRU without attention)
@@ -439,6 +443,101 @@ class ActorCriticSRU(nn.Module):
         scripted = torch.jit.script(exporter)
         scripted.save(filepath)
         print(f"[ActorCriticSRU] Exported JIT policy ({self.num_cameras} camera) to: {filepath}")
+
+    def export_onnx(self, path: str, filename: str = "policy.onnx", normalizer=None):
+        """Export policy as an ONNX model for inference.
+
+        The exported module includes the complete actor pipeline:
+        CrossAttention → MemorySRU → LinearDropout → Actor MLP
+
+        For recurrent networks, hidden states are exposed as explicit inputs and outputs
+        since ONNX doesn't support stateful ops.
+
+        Uses specialized exporters for single vs dual camera configurations.
+
+        The ONNX model has the following interface:
+            Inputs:
+                - obs: Observation tensor of shape (1, num_actor_obs)
+                - h_in: Hidden state tensor of shape (num_layers, 1, hidden_size)
+                - c_in: Cell state tensor of shape (num_layers, 1, hidden_size)
+            Outputs:
+                - actions: Action tensor of shape (1, num_actions)
+                - h_out: Updated hidden state
+                - c_out: Updated cell state
+
+        Args:
+            path: Directory path to save the exported model.
+            filename: Name of the exported file. Defaults to "policy.onnx".
+            normalizer: Optional normalizer module for observations.
+        """
+        import os
+
+        rnn = self.memory_a.rnn
+
+        # Select optimized exporter based on camera count
+        if self.num_cameras == 2:
+            exporter = _ActorCriticSRUONNXExporterDualCam(
+                attn_image_net=self.attn_image_net,
+                memory_a=self.memory_a,
+                linear_dropout_actor=self.linear_dropout_actor,
+                actor=self.actor,
+                image_input_dims=self.image_input_dims,
+                num_image_features=self.num_image_features,
+                actor_proprioceptive_input_dim=self.actor_proprioceptive_input_dim,
+                normalizer=normalizer,
+            )
+        else:
+            exporter = _ActorCriticSRUONNXExporterSingleCam(
+                attn_image_net=self.attn_image_net,
+                memory_a=self.memory_a,
+                linear_dropout_actor=self.linear_dropout_actor,
+                actor=self.actor,
+                image_input_dims=self.image_input_dims,
+                num_image_features=self.num_image_features,
+                actor_proprioceptive_input_dim=self.actor_proprioceptive_input_dim,
+                normalizer=normalizer,
+            )
+
+        exporter.eval()
+        exporter.to("cpu")
+
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+
+        # Create dummy inputs
+        dummy_obs = torch.zeros(1, self.num_actor_obs)
+        dummy_hidden = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+        dummy_cell = torch.zeros(rnn.num_layers, 1, rnn.hidden_size)
+        dummy_inputs = (dummy_obs, dummy_hidden, dummy_cell)
+
+        input_names = ["obs", "h_in", "c_in"]
+        output_names = ["actions", "h_out", "c_out"]
+        dynamic_axes = {
+            "obs": {0: "batch_size"},
+            "h_in": {1: "batch_size"},
+            "c_in": {1: "batch_size"},
+            "actions": {0: "batch_size"},
+            "h_out": {1: "batch_size"},
+            "c_out": {1: "batch_size"},
+        }
+
+        # Export to ONNX
+        torch.onnx.export(
+            exporter,
+            dummy_inputs,
+            filepath,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=17,
+            do_constant_folding=True,
+        )
+        print(f"[ActorCriticSRU] Exported ONNX policy ({self.num_cameras} camera) to: {filepath}")
+        print(f"  - Input 'obs': shape (1, {self.num_actor_obs})")
+        print(f"  - Input 'h_in': shape ({rnn.num_layers}, 1, {rnn.hidden_size})")
+        print(f"  - Input 'c_in': shape ({rnn.num_layers}, 1, {rnn.hidden_size})")
+        print(f"  - Output 'actions', 'h_out', 'c_out'")
+        print(f"  - Note: Initialize h_in/c_in to zeros at episode start")
 
 
 class _ActorCriticSRUExporterSingleCam(nn.Module):
@@ -761,3 +860,148 @@ class LinearConstDropout(nn.Module):
 
     def reset_dropout_mask(self):
         self.dropout_masks = None
+
+
+class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
+    """ONNX-exportable wrapper for ActorCriticSRU with single camera.
+
+    Hidden states are explicit inputs/outputs since ONNX doesn't support stateful ops.
+    Positional encodings are lazily cached on first forward pass.
+    """
+
+    def __init__(
+        self,
+        attn_image_net,
+        memory_a,
+        linear_dropout_actor,
+        actor,
+        image_input_dims: tuple,
+        num_image_features: int,
+        actor_proprioceptive_input_dim: int,
+        normalizer=None,
+    ):
+        super().__init__()
+        import copy
+
+        self.attn_image_net = copy.deepcopy(attn_image_net)
+        self.rnn = copy.deepcopy(memory_a.rnn)
+        self.linear = copy.deepcopy(linear_dropout_actor.linear)
+        self.activation = copy.deepcopy(linear_dropout_actor.activation)
+        self.actor = copy.deepcopy(actor)
+        self.normalizer = copy.deepcopy(normalizer) if normalizer else nn.Identity()
+
+        # Store dimensions
+        self.num_image_features = num_image_features
+        self.actor_proprioceptive_input_dim = actor_proprioceptive_input_dim
+        self.image_c = image_input_dims[0]
+        self.image_h = image_input_dims[1]
+        self.image_w = image_input_dims[2]
+
+    def forward(
+        self, observations: torch.Tensor, hidden_state: torch.Tensor, cell_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass with explicit hidden state I/O."""
+        observations = self.normalizer(observations)
+
+        # Split observations into proprioceptive and image parts
+        other_obs = observations[..., :-self.num_image_features]
+        other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
+
+        # Extract and reshape single camera image, add depth dimension
+        image_obs = observations[..., -self.num_image_features:]
+        image_obs = image_obs.reshape(-1, self.image_c, self.image_h, self.image_w)
+        image_obs = image_obs.unsqueeze(2)  # (B, C, 1, H, W)
+
+        # Attention processing (positional encoding cached on first call)
+        image_features = self.attn_image_net(image_obs, other_obs)
+
+        # Concatenate image features with proprioceptive observations
+        combined_features = torch.cat([image_features, other_obs], dim=-1)
+
+        # RNN processing with explicit state I/O
+        combined_features, (h_out, c_out) = self.rnn(
+            combined_features.unsqueeze(0),
+            (hidden_state, cell_state)
+        )
+        combined_features = combined_features.squeeze(0)
+
+        # Linear + activation (no dropout during inference)
+        combined_features = self.activation(self.linear(combined_features))
+
+        # Actor MLP
+        actions = self.actor(combined_features)
+        return actions, h_out, c_out
+
+
+class _ActorCriticSRUONNXExporterDualCam(nn.Module):
+    """ONNX-exportable wrapper for ActorCriticSRU with dual cameras.
+
+    Hidden states are explicit inputs/outputs since ONNX doesn't support stateful ops.
+    Positional encodings are lazily cached on first forward pass.
+    """
+
+    def __init__(
+        self,
+        attn_image_net,
+        memory_a,
+        linear_dropout_actor,
+        actor,
+        image_input_dims: tuple,
+        num_image_features: int,
+        actor_proprioceptive_input_dim: int,
+        normalizer=None,
+    ):
+        super().__init__()
+        import copy
+
+        self.attn_image_net = copy.deepcopy(attn_image_net)
+        self.rnn = copy.deepcopy(memory_a.rnn)
+        self.linear = copy.deepcopy(linear_dropout_actor.linear)
+        self.activation = copy.deepcopy(linear_dropout_actor.activation)
+        self.actor = copy.deepcopy(actor)
+        self.normalizer = copy.deepcopy(normalizer) if normalizer else nn.Identity()
+
+        # Store dimensions
+        self.num_image_features = num_image_features
+        self.actor_proprioceptive_input_dim = actor_proprioceptive_input_dim
+        self.image_c = image_input_dims[0]
+        self.image_h = image_input_dims[1]
+        self.image_w = image_input_dims[2]
+
+    def forward(
+        self, observations: torch.Tensor, hidden_state: torch.Tensor, cell_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass with explicit hidden state I/O."""
+        observations = self.normalizer(observations)
+
+        # Split observations into proprioceptive and image parts (2 cameras)
+        other_obs = observations[..., :-self.num_image_features * 2]
+        other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
+
+        # Extract and reshape dual camera images, then stack along depth dimension
+        image_obs_front = observations[..., -self.num_image_features * 2: -self.num_image_features]
+        image_obs_back = observations[..., -self.num_image_features:]
+        image_front = image_obs_front.reshape(-1, self.image_c, self.image_h, self.image_w)
+        image_back = image_obs_back.reshape(-1, self.image_c, self.image_h, self.image_w)
+        # Stack along depth dimension: (B, C, 2, H, W)
+        image_stacked = torch.stack([image_front, image_back], dim=2)
+
+        # Attention processing (positional encoding cached on first call)
+        image_features = self.attn_image_net(image_stacked, other_obs)
+
+        # Concatenate image features with proprioceptive observations
+        combined_features = torch.cat([image_features, other_obs], dim=-1)
+
+        # RNN processing with explicit state I/O
+        combined_features, (h_out, c_out) = self.rnn(
+            combined_features.unsqueeze(0),
+            (hidden_state, cell_state)
+        )
+        combined_features = combined_features.squeeze(0)
+
+        # Linear + activation (no dropout during inference)
+        combined_features = self.activation(self.linear(combined_features))
+
+        # Actor MLP
+        actions = self.actor(combined_features)
+        return actions, h_out, c_out

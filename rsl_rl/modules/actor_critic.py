@@ -135,6 +135,53 @@ class ActorCritic(nn.Module):
         scripted.save(filepath)
         print(f"[ActorCritic] Exported JIT policy to: {filepath}")
 
+    def export_onnx(self, path: str, filename: str = "policy.onnx", normalizer=None):
+        """Export policy as an ONNX model for inference.
+
+        The ONNX model has the following interface:
+            Inputs:
+                - obs: Observation tensor of shape (1, num_obs)
+            Outputs:
+                - actions: Action tensor of shape (1, num_actions)
+
+        Args:
+            path: Directory path to save the exported model.
+            filename: Name of the exported file. Defaults to "policy.onnx".
+            normalizer: Optional normalizer module for observations.
+        """
+        import os
+
+        exporter = _MLPPolicyONNXExporter(self.actor, normalizer)
+        exporter.eval()
+        exporter.to("cpu")
+
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+
+        # Infer input size from first layer
+        num_obs = self.actor[0].in_features
+
+        # Create dummy input
+        dummy_obs = torch.zeros(1, num_obs)
+
+        # Export to ONNX
+        torch.onnx.export(
+            exporter,
+            dummy_obs,
+            filepath,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={
+                "obs": {0: "batch_size"},
+                "actions": {0: "batch_size"},
+            },
+            opset_version=17,
+            do_constant_folding=True,
+        )
+        print(f"[ActorCritic] Exported ONNX policy to: {filepath}")
+        print(f"  - Input 'obs': shape (1, {num_obs})")
+        print(f"  - Output 'actions'")
+
 
 class _MLPPolicyExporter(nn.Module):
     """JIT-exportable wrapper for non-recurrent ActorCritic."""
@@ -151,6 +198,19 @@ class _MLPPolicyExporter(nn.Module):
     @torch.jit.export
     def reset(self):
         pass
+
+
+class _MLPPolicyONNXExporter(nn.Module):
+    """ONNX-exportable wrapper for non-recurrent ActorCritic."""
+
+    def __init__(self, actor, normalizer=None):
+        super().__init__()
+        import copy
+        self.actor = copy.deepcopy(actor)
+        self.normalizer = copy.deepcopy(normalizer) if normalizer else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.actor(self.normalizer(x))
 
 
 def get_activation(act_name):

@@ -35,6 +35,11 @@ This framework is designed to train navigation policies that achieve 23.5% impro
 - Temporally consistent dropout across trajectories
 - Multi-sensor observation handling
 
+✅ **Model Export**
+- JIT export for PyTorch deployment
+- ONNX export for cross-platform inference (C++, ROS, TensorRT)
+- Explicit hidden state I/O for recurrent models in ONNX format
+
 ✅ **Logging & Monitoring**
 - Tensorboard integration
 - Weights & Biases support
@@ -70,8 +75,7 @@ sru-navigation-learning/
 │   ├── networks/              # Network components
 │   │   └── sru_memory/        # SRU memory modules
 │   │       ├── lstm_sru.py              # LSTM with SRU gating
-│   │       ├── attention.py             # Cross-attention fusion
-│   │       └── pos_embed.py             # 3D positional encoding
+│   │       └── attention.py             # Cross-attention fusion with 3D positional encoding
 │   ├── runners/               # Training orchestration
 │   │   └── on_policy_runner.py          # Main training loop
 │   ├── storage/               # Experience replay
@@ -227,6 +231,27 @@ The framework supports multiple logging backends configured through the `logger`
 - **Tensorboard**: https://www.tensorflow.org/tensorboard/
 - **Weights & Biases**: https://wandb.ai/site
 - **Neptune**: https://docs.neptune.ai/
+
+### Model Export
+
+Export trained policies for deployment:
+
+```python
+# Load trained model
+policy = ActorCriticSRU(...)
+policy.load_state_dict(torch.load("checkpoint.pt"))
+
+# Export to JIT (PyTorch deployment)
+policy.export_jit(path="./exported", filename="policy.pt", normalizer=obs_normalizer)
+
+# Export to ONNX (C++, ROS, TensorRT deployment)
+policy.export_onnx(path="./exported", filename="policy.onnx", normalizer=obs_normalizer)
+```
+
+**ONNX Export Notes for Recurrent Models**:
+- Hidden states are exposed as explicit inputs/outputs (`h_in`, `c_in` → `h_out`, `c_out`)
+- Initialize hidden states to zeros at episode start
+- Pass updated hidden states back as inputs for the next timestep
 
 ## Key Features
 

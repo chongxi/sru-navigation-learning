@@ -96,7 +96,7 @@ class MDPO:
         gamma: float = 0.998,
         lam: float = 0.95,
         value_loss_coef: float = 1.0,
-        distill_coef: float = 0.1,
+        distill_coef: float = 0.02,
         entropy_coef: float = 0.0,
         learning_rate: float = 1e-3,
         min_learning_rate: float = 1e-7,
