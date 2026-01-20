@@ -8,14 +8,10 @@ from .sru_memory import (
     LSTM_SRU,
     LSTMSRUCell,
     CrossAttentionFuseModule,
-    PositionalEncoding3D,
-    PositionalEncodingPermute3D,
 )
 
 __all__ = [
     "LSTM_SRU",
     "LSTMSRUCell",
     "CrossAttentionFuseModule",
-    "PositionalEncoding3D",
-    "PositionalEncodingPermute3D",
 ]
