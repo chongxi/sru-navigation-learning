@@ -13,6 +13,28 @@ from rsl_rl.storage import RolloutStorage
 
 EPSILON = 1e-7
 
+
+def _align_mask(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    while mask.dim() > values.dim():
+        mask = mask.squeeze(-1)
+    while mask.dim() < values.dim():
+        mask = mask.unsqueeze(-1)
+    return mask.to(values.dtype)
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    aligned_mask = _align_mask(values, mask)
+    denom = aligned_mask.sum().clamp_min(1.0)
+    return (values * aligned_mask).sum() / denom
+
+
+def _masked_normalize(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    aligned_mask = _align_mask(values, mask)
+    mean = _masked_mean(values, aligned_mask)
+    var = _masked_mean((values - mean).square(), aligned_mask)
+    normalized = (values - mean) / torch.sqrt(var + EPSILON)
+    return torch.where(aligned_mask > 0, normalized, torch.zeros_like(values))
+
 class PPO:
     actor_critic: ActorCritic
 
@@ -90,6 +112,10 @@ class PPO:
     def process_env_step(self, rewards, dones, infos):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        self.transition.valid_mask = infos.get(
+            "transition_valid",
+            torch.ones_like(dones, dtype=torch.bool, device=self.device),
+        )
         # Bootstrapping on time outs
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
@@ -133,6 +159,7 @@ class PPO:
             masks_batch,
             dropout_masks_a,
             dropout_masks_c,
+            valid_mask_batch,
         ) in generator:
             self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0], dropout_masks=dropout_masks_a)
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
@@ -154,7 +181,7 @@ class PPO:
                         - 0.5,
                         dim=-1,
                     )
-                    kl_mean = torch.mean(kl)
+                    kl_mean = _masked_mean(kl, valid_mask_batch)
 
                     if kl_mean > self.desired_kl * 2.0:
                         self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -166,7 +193,7 @@ class PPO:
                         
             # normalize advantages
             with torch.no_grad():
-                advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + EPSILON)
+                advantages_batch = _masked_normalize(advantages_batch, valid_mask_batch)
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -174,7 +201,7 @@ class PPO:
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = _masked_mean(torch.max(surrogate, surrogate_clipped), valid_mask_batch)
             # print("PPO max ratio: ", ratio.max().item())
 
             # Value function loss
@@ -184,11 +211,11 @@ class PPO:
                 )
                 value_losses = (value_batch - returns_batch).pow(2)
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean() * 0.5
+                value_loss = _masked_mean(torch.max(value_losses, value_losses_clipped), valid_mask_batch) * 0.5
             else:
-                value_loss = (returns_batch - value_batch).pow(2).mean() * 0.5
+                value_loss = _masked_mean((returns_batch - value_batch).pow(2), valid_mask_batch) * 0.5
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * _masked_mean(entropy_batch, valid_mask_batch)
 
             # Gradient step
             self.optimizer.zero_grad()

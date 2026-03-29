@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from typing import TYPE_CHECKING
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,28 @@ except ImportError:
     MUON_AVAILABLE = False
 
 EPSILON = 1e-7
+
+
+def _align_mask(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    while mask.dim() > values.dim():
+        mask = mask.squeeze(-1)
+    while mask.dim() < values.dim():
+        mask = mask.unsqueeze(-1)
+    return mask.to(values.dtype)
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    aligned_mask = _align_mask(values, mask)
+    denom = aligned_mask.sum().clamp_min(1.0)
+    return (values * aligned_mask).sum() / denom
+
+
+def _masked_normalize(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    aligned_mask = _align_mask(values, mask)
+    mean = _masked_mean(values, aligned_mask)
+    var = _masked_mean((values - mean).square(), aligned_mask)
+    normalized = (values - mean) / torch.sqrt(var + EPSILON)
+    return torch.where(aligned_mask > 0, normalized, torch.zeros_like(values))
 
 
 def _kl_gaussian(mu_t: torch.Tensor, std_t: torch.Tensor, mu_s: torch.Tensor, std_s: torch.Tensor) -> torch.Tensor:
@@ -298,11 +321,16 @@ class MDPO:
         """Process environment step and store transitions."""
         rewards_1, rewards_2 = rewards[self.indices_1], rewards[self.indices_2]
         dones_1, dones_2 = dones[self.indices_1], dones[self.indices_2]
+        valid_mask = infos.get("transition_valid", torch.ones_like(dones, dtype=torch.bool, device=self.device))
+        valid_mask_1 = valid_mask[self.indices_1]
+        valid_mask_2 = valid_mask[self.indices_2]
 
         self.transition_1.rewards = rewards_1.clone()
         self.transition_2.rewards = rewards_2.clone()
         self.transition_1.dones = dones_1
         self.transition_2.dones = dones_2
+        self.transition_1.valid_mask = valid_mask_1
+        self.transition_2.valid_mask = valid_mask_2
 
         # Bootstrap on time-out truncations
         if "time_outs" in infos:
@@ -384,6 +412,7 @@ class MDPO:
         target_values: torch.Tensor,
         returns: torch.Tensor,
         entropy: torch.Tensor,
+        valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute PPO surrogate and value losses.
 
@@ -395,7 +424,7 @@ class MDPO:
         advantages_squeezed = advantages.squeeze()
         surrogate = -advantages_squeezed * ratio
         surrogate_clipped = -advantages_squeezed * ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)
-        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+        surrogate_loss = _masked_mean(torch.max(surrogate, surrogate_clipped), valid_mask)
 
         # Value loss
         if self.use_clipped_value_loss:
@@ -404,12 +433,12 @@ class MDPO:
             )
             value_losses = (value_batch - returns).square()
             value_losses_clipped = (value_clipped - returns).square()
-            value_loss = torch.max(value_losses, value_losses_clipped).mean() * 0.5
+            value_loss = _masked_mean(torch.max(value_losses, value_losses_clipped), valid_mask) * 0.5
         else:
-            value_loss = (returns - value_batch).square().mean() * 0.5
+            value_loss = _masked_mean((returns - value_batch).square(), valid_mask) * 0.5
 
         # Combined policy loss
-        policy_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+        policy_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * _masked_mean(entropy, valid_mask)
 
         return surrogate_loss, value_loss, policy_loss
 
@@ -440,20 +469,20 @@ class MDPO:
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
 
-        for batch_1, batch_2 in zip(generator_1, generator_2):
+        for batch_1, batch_2 in tqdm(zip(generator_1, generator_2), total=num_updates, desc="MDPO update", leave=False):
             # Unpack mini-batches
             (
                 obs_batch_1, critic_obs_batch_1, actions_batch_1, target_values_batch_1,
                 advantages_batch_1, returns_batch_1, old_actions_log_prob_batch_1,
                 old_mu_batch_1, old_sigma_batch_1, hid_states_batch_1, masks_batch_1,
-                dropout_masks_a_1, dropout_masks_c_1,
+                dropout_masks_a_1, dropout_masks_c_1, valid_mask_batch_1,
             ) = batch_1
 
             (
                 obs_batch_2, critic_obs_batch_2, actions_batch_2, target_values_batch_2,
                 advantages_batch_2, returns_batch_2, old_actions_log_prob_batch_2,
                 old_mu_batch_2, old_sigma_batch_2, hid_states_batch_2, masks_batch_2,
-                dropout_masks_a_2, dropout_masks_c_2,
+                dropout_masks_a_2, dropout_masks_c_2, valid_mask_batch_2,
             ) = batch_2
 
             # Forward pass for Policy 1
@@ -482,17 +511,17 @@ class MDPO:
 
             # Normalize advantages
             with torch.no_grad():
-                advantages_batch_1 = (advantages_batch_1 - advantages_batch_1.mean()) / (advantages_batch_1.std() + EPSILON)
-                advantages_batch_2 = (advantages_batch_2 - advantages_batch_2.mean()) / (advantages_batch_2.std() + EPSILON)
+                advantages_batch_1 = _masked_normalize(advantages_batch_1, valid_mask_batch_1)
+                advantages_batch_2 = _masked_normalize(advantages_batch_2, valid_mask_batch_2)
 
             # Compute PPO losses
             surrogate_loss_1, value_loss_1, policy_loss_1 = self._compute_ppo_loss(
                 actions_log_prob_1, old_actions_log_prob_batch_1, advantages_batch_1,
-                value_batch_1, target_values_batch_1, returns_batch_1, entropy_batch_1
+                value_batch_1, target_values_batch_1, returns_batch_1, entropy_batch_1, valid_mask_batch_1
             )
             surrogate_loss_2, value_loss_2, policy_loss_2 = self._compute_ppo_loss(
                 actions_log_prob_2, old_actions_log_prob_batch_2, advantages_batch_2,
-                value_batch_2, target_values_batch_2, returns_batch_2, entropy_batch_2
+                value_batch_2, target_values_batch_2, returns_batch_2, entropy_batch_2, valid_mask_batch_2
             )
 
             # Compute KL divergence for mutual distillation
@@ -514,8 +543,12 @@ class MDPO:
             teacher_sigma_2 = self.actor_critic_1.action_std
 
             # KL divergence losses - both policies are regularized to match each other
-            distill_kl_1 = _kl_gaussian(teacher_mu_1, teacher_sigma_1, mu_batch_1, sigma_batch_1).mean()
-            distill_kl_2 = _kl_gaussian(teacher_mu_2, teacher_sigma_2, mu_batch_2, sigma_batch_2).mean()
+            distill_kl_1 = _masked_mean(
+                _kl_gaussian(teacher_mu_1, teacher_sigma_1, mu_batch_1, sigma_batch_1), valid_mask_batch_1
+            )
+            distill_kl_2 = _masked_mean(
+                _kl_gaussian(teacher_mu_2, teacher_sigma_2, mu_batch_2, sigma_batch_2), valid_mask_batch_2
+            )
 
             # Total loss with distillation
             total_loss = 0.5 * (

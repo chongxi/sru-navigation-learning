@@ -96,6 +96,9 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        self._staggered_env_bucket_ids = torch.empty(0, dtype=torch.long, device=self.device)
+        self._staggered_bucket_phases = torch.empty(0, dtype=torch.long, device=self.device)
+        self._staggered_max_rollout_phases = 0
 
     def _reset_policy_memories(self, dones: torch.Tensor):
         """Reset recurrent policy memory for envs that ended during warm-up."""
@@ -116,6 +119,39 @@ class OnPolicyRunner:
             self.alg.transition.clear()
             self.alg.storage.clear()
 
+    def _reset_staggered_gate_schedule(self):
+        """Clear the runner-side staggered gate schedule."""
+        self._staggered_env_bucket_ids = torch.empty(0, dtype=torch.long, device=self.device)
+        self._staggered_bucket_phases = torch.empty(0, dtype=torch.long, device=self.device)
+        self._staggered_max_rollout_phases = 0
+
+    def _bucket_env_ids(self, bucket_idx: int) -> torch.Tensor:
+        """Return env ids currently assigned to a staggered reset bucket."""
+        if self._staggered_env_bucket_ids.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        return (self._staggered_env_bucket_ids == bucket_idx).nonzero(as_tuple=False).squeeze(-1)
+
+    def _apply_staggered_reset_gate(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the next reset gate and return fresh normalized observations."""
+        if self._staggered_bucket_phases.numel() == 0:
+            obs, extras = self.env.get_observations()
+            return self._compute_normalized_observations(obs, extras)
+
+        self._staggered_bucket_phases += 1
+        due_bucket_ids = (self._staggered_bucket_phases >= self._staggered_max_rollout_phases).nonzero(as_tuple=False).squeeze(-1)
+        for bucket_idx in due_bucket_ids.tolist():
+            gate_env_ids = self._bucket_env_ids(bucket_idx)
+            reset_env_ids = self.env.unwrapped.apply_staggered_reset_gate(gate_env_ids)
+            if reset_env_ids.numel() > 0:
+                self._staggered_env_bucket_ids[reset_env_ids] = bucket_idx
+                manual_dones = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
+                manual_dones[reset_env_ids] = 1
+                self._reset_policy_memories(manual_dones)
+            self._staggered_bucket_phases[bucket_idx] = 0
+
+        obs, extras = self.env.get_observations()
+        return self._compute_normalized_observations(obs, extras)
+
     def _compute_normalized_observations(
         self, obs: torch.Tensor, extras: dict
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -132,6 +168,8 @@ class OnPolicyRunner:
         num_buckets = min(max(1, requested_buckets), self.env.num_envs, max_buckets)
 
         if num_buckets <= 1:
+            self._reset_staggered_gate_schedule()
+            self.env.unwrapped.configure_staggered_reset_gating(False)
             return self._compute_normalized_observations(*self.env.reset())
 
         print(
@@ -139,14 +177,30 @@ class OnPolicyRunner:
             f" buckets={num_buckets}, rollout_len={self.num_steps_per_env}, max_episode_length={max_episode_length}"
         )
 
-        all_env_ids = torch.arange(self.env.num_envs, dtype=torch.long, device=self.device)
-        bucket_env_ids = [all_env_ids[bucket_idx::num_buckets] for bucket_idx in range(num_buckets)]
+        max_rollout_phases = max_buckets
+        target_bucket_phases = torch.div(
+            torch.arange(num_buckets, device=self.device, dtype=torch.long) * max_rollout_phases,
+            num_buckets,
+            rounding_mode="floor",
+        )
+        warmup_chunks = int(target_bucket_phases.max().item())
+        warmup_env_steps = warmup_chunks * self.num_steps_per_env
+        print(
+            "[INFO] Staggered warm-up:"
+            f" chunks={warmup_chunks}, env_steps={warmup_env_steps}, bucket_phases={target_bucket_phases.tolist()}"
+        )
+        env_bucket_ids = torch.arange(self.env.num_envs, device=self.device, dtype=torch.long) % num_buckets
+        self._staggered_env_bucket_ids = env_bucket_ids
+        self._staggered_bucket_phases = target_bucket_phases.clone()
+        self._staggered_max_rollout_phases = max_rollout_phases
 
+        self.env.unwrapped.configure_staggered_reset_gating(True)
         obs, extras = self.env.reset()
         obs, critic_obs = self._compute_normalized_observations(obs, extras)
 
         with torch.no_grad():
-            for chunk_idx in range(num_buckets - 1):
+            max_target_phase = int(target_bucket_phases.max().item())
+            for chunk_idx in tqdm(range(max_target_phase), desc="Stagger warmup", leave=False):
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     obs, _, dones, infos = self.env.step(actions)
@@ -154,16 +208,15 @@ class OnPolicyRunner:
                     self._reset_policy_memories(dones)
                     obs, critic_obs = self._compute_normalized_observations(obs, infos)
 
-                reset_bucket_idx = num_buckets - 2 - chunk_idx
-                reset_env_ids = bucket_env_ids[reset_bucket_idx]
-                if reset_env_ids.numel() == 0:
-                    continue
-
-                self.env.unwrapped.reset(env_ids=reset_env_ids)
-                manual_dones = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
-                manual_dones[reset_env_ids] = 1
-                self._reset_policy_memories(manual_dones)
-
+                due_phase = max_target_phase - (chunk_idx + 1)
+                due_bucket_ids = (target_bucket_phases == due_phase).nonzero(as_tuple=False).squeeze(-1)
+                for bucket_idx in due_bucket_ids.tolist():
+                    reset_env_ids = self.env.unwrapped.apply_staggered_reset_gate(self._bucket_env_ids(bucket_idx))
+                    if reset_env_ids.numel() > 0:
+                        self._staggered_env_bucket_ids[reset_env_ids] = bucket_idx
+                        manual_dones = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
+                        manual_dones[reset_env_ids] = 1
+                        self._reset_policy_memories(manual_dones)
                 obs, extras = self.env.get_observations()
                 obs, critic_obs = self._compute_normalized_observations(obs, extras)
 
@@ -209,6 +262,9 @@ class OnPolicyRunner:
         if staggered_reset_buckets > 1:
             obs, critic_obs = self._apply_staggered_resets(staggered_reset_buckets)
         else:
+            self._reset_staggered_gate_schedule()
+            if hasattr(self.env.unwrapped, "configure_staggered_reset_gating"):
+                self.env.unwrapped.configure_staggered_reset_gating(False)
             if init_at_random_ep_len:
                 self.env.episode_length_buf = torch.randint_like(
                     self.env.episode_length_buf, high=int(self.env.max_episode_length)
@@ -260,6 +316,11 @@ class OnPolicyRunner:
                         critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
                     else:
                         critic_obs = obs
+                    transition_valid = ~infos.get(
+                        "staggered_invalid",
+                        torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device),
+                    )
+                    infos["transition_valid"] = transition_valid
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
                         critic_obs.to(self.device),
@@ -279,8 +340,8 @@ class OnPolicyRunner:
                         if self.is_mdpo and reward_shifting_value != 0.0:
                             log_rewards = rewards - reward_shifting_value
 
-                        cur_reward_sum += log_rewards
-                        cur_episode_length += 1
+                        cur_reward_sum[transition_valid] += log_rewards[transition_valid]
+                        cur_episode_length[transition_valid] += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
@@ -289,6 +350,11 @@ class OnPolicyRunner:
 
                 stop = time.time()
                 collection_time = stop - start
+
+                if self._staggered_bucket_phases.numel() > 0:
+                    obs, critic_obs = self._apply_staggered_reset_gate()
+                    stop = time.time()
+                    collection_time = stop - start
 
                 # Learning step
                 start = stop

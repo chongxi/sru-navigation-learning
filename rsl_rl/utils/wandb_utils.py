@@ -52,7 +52,8 @@ class WandbSummaryWriter(SummaryWriter):
         # Set wandb run name to match the log directory name
         wandb.run.name = run_name
 
-        wandb.log({"log_dir": run_name})
+        # Store metadata without advancing WandB's internal step counter.
+        wandb.run.summary["log_dir"] = run_name
 
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
         wandb.config.update({"runner_cfg": runner_cfg})

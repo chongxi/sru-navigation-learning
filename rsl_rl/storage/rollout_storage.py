@@ -17,6 +17,7 @@ class RolloutStorage:
             self.critic_observations = None
             self.actions = None
             self.rewards = None
+            self.valid_mask = None
             self.dones = None
             self.values = None
             self.actions_log_prob = None
@@ -44,6 +45,7 @@ class RolloutStorage:
         else:
             self.privileged_observations = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.valid_mask = torch.ones(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -76,6 +78,10 @@ class RolloutStorage:
             self.privileged_observations[self.step].copy_(transition.critic_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        if transition.valid_mask is None:
+            self.valid_mask[self.step].fill_(1.0)
+        else:
+            self.valid_mask[self.step].copy_(transition.valid_mask.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
@@ -151,6 +157,7 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        valid_mask = self.valid_mask.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -167,10 +174,11 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                valid_mask_batch = valid_mask[batch_idx]
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None, None, None
+                ), None, None, None, valid_mask_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -179,7 +187,6 @@ class RolloutStorage:
             padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
         else:
             padded_critic_obs_trajectories = padded_obs_trajectories
-
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
             first_traj = 0
@@ -205,6 +212,7 @@ class RolloutStorage:
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                valid_mask_batch = self.valid_mask[:, start:stop]
 
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
@@ -233,6 +241,6 @@ class RolloutStorage:
                 yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,
                     hid_c_batch,
-                ), masks_batch, dropout_masks_a, dropout_masks_c
+                ), masks_batch, dropout_masks_a, dropout_masks_c, valid_mask_batch
 
                 first_traj = last_traj

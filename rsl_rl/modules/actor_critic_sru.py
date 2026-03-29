@@ -172,8 +172,12 @@ class ActorCriticSRU(nn.Module):
         print(f"[ActorCriticSRU] Actor RNN: {self.memory_a}")
         print(f"[ActorCriticSRU] Critic RNN: {self.memory_c}")
         print(f"[ActorCriticSRU] Num cameras: {self.num_cameras}")
-        # Action noise: using log_std parameter
-        self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        # Action noise: using log_std parameter (supports scalar or per-dim list/tensor)
+        if isinstance(init_noise_std, (list, tuple)):
+            init_std = torch.tensor(init_noise_std, dtype=torch.float32)
+        else:
+            init_std = init_noise_std * torch.ones(num_actions)
+        self.log_std = nn.Parameter(torch.log(init_std))
         self.distribution = None
         Normal.set_default_validate_args(False)
 
