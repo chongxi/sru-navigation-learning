@@ -10,6 +10,7 @@ import os
 import statistics
 import time
 from collections import deque
+from tqdm import tqdm
 
 import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
@@ -96,12 +97,92 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    def _reset_policy_memories(self, dones: torch.Tensor):
+        """Reset recurrent policy memory for envs that ended during warm-up."""
+        if self.is_mdpo:
+            self.alg.actor_critic_1.reset(dones[self.alg.indices_1])
+            self.alg.actor_critic_2.reset(dones[self.alg.indices_2])
+        else:
+            self.alg.actor_critic.reset(dones)
+
+    def _clear_warmup_transitions(self):
+        """Drop any temporary transition data generated during stagger warm-up."""
+        if self.is_mdpo:
+            self.alg.transition_1.clear()
+            self.alg.transition_2.clear()
+            self.alg.storage_1.clear()
+            self.alg.storage_2.clear()
+        else:
+            self.alg.transition.clear()
+            self.alg.storage.clear()
+
+    def _compute_normalized_observations(
+        self, obs: torch.Tensor, extras: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize current actor and critic observations on the runner device."""
+        critic_obs = extras["observations"].get("critic", obs)
+        obs = self.obs_normalizer(obs)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
+        return obs.to(self.device), critic_obs.to(self.device)
+
+    def _apply_staggered_resets(self, requested_buckets: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance envs in rollout-length chunks so batches start with mixed task phases."""
+        max_episode_length = int(self.env.max_episode_length)
+        max_buckets = max(1, (max_episode_length + self.num_steps_per_env - 1) // self.num_steps_per_env)
+        num_buckets = min(max(1, requested_buckets), self.env.num_envs, max_buckets)
+
+        if num_buckets <= 1:
+            return self._compute_normalized_observations(*self.env.reset())
+
+        print(
+            "[INFO] Applying staggered resets:"
+            f" buckets={num_buckets}, rollout_len={self.num_steps_per_env}, max_episode_length={max_episode_length}"
+        )
+
+        all_env_ids = torch.arange(self.env.num_envs, dtype=torch.long, device=self.device)
+        bucket_env_ids = [all_env_ids[bucket_idx::num_buckets] for bucket_idx in range(num_buckets)]
+
+        obs, extras = self.env.reset()
+        obs, critic_obs = self._compute_normalized_observations(obs, extras)
+
+        with torch.no_grad():
+            for chunk_idx in range(num_buckets - 1):
+                for _ in range(self.num_steps_per_env):
+                    actions = self.alg.act(obs, critic_obs)
+                    obs, _, dones, infos = self.env.step(actions)
+                    dones = dones.to(self.device)
+                    self._reset_policy_memories(dones)
+                    obs, critic_obs = self._compute_normalized_observations(obs, infos)
+
+                reset_bucket_idx = num_buckets - 2 - chunk_idx
+                reset_env_ids = bucket_env_ids[reset_bucket_idx]
+                if reset_env_ids.numel() == 0:
+                    continue
+
+                self.env.unwrapped.reset(env_ids=reset_env_ids)
+                manual_dones = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
+                manual_dones[reset_env_ids] = 1
+                self._reset_policy_memories(manual_dones)
+
+                obs, extras = self.env.get_observations()
+                obs, critic_obs = self._compute_normalized_observations(obs, extras)
+
+        self._clear_warmup_transitions()
+        self.alg.reset_dropout_masks()
+        return obs, critic_obs
+
+    def learn(
+        self,
+        num_learning_iterations: int,
+        init_at_random_ep_len: bool = False,
+        staggered_reset_buckets: int = 0,
+    ):
         """Run the training loop.
 
         Args:
             num_learning_iterations: Number of training iterations.
             init_at_random_ep_len: If True, randomize initial episode lengths.
+            staggered_reset_buckets: Number of rollout-phase buckets to create by pre-rolling envs.
         """
         # initialize writer
         if self.log_dir is not None and self.writer is None:
@@ -123,14 +204,18 @@ class OnPolicyRunner:
             else:
                 raise AssertionError("logger type not found")
 
-        if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
-        obs, extras = self.env.get_observations()
-        critic_obs = extras["observations"].get("critic", obs)
-        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()
+
+        if staggered_reset_buckets > 1:
+            obs, critic_obs = self._apply_staggered_resets(staggered_reset_buckets)
+        else:
+            if init_at_random_ep_len:
+                self.env.episode_length_buf = torch.randint_like(
+                    self.env.episode_length_buf, high=int(self.env.max_episode_length)
+                )
+            obs, extras = self.env.get_observations()
+            critic_obs = extras["observations"].get("critic", obs)
+            obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
 
         ep_infos = []
         rewbuffer = deque(maxlen=100)
@@ -157,7 +242,7 @@ class OnPolicyRunner:
 
             # Rollout
             with torch.no_grad():
-                for i in range(self.num_steps_per_env):
+                for i in tqdm(range(self.num_steps_per_env), desc=f"Iter {it}/{tot_iter} rollout", leave=False):
                     actions = self.alg.act(obs, critic_obs)
                     obs, rewards, dones, infos = self.env.step(actions)
 
@@ -339,7 +424,12 @@ class OnPolicyRunner:
         if self.is_mdpo:
             saved_dict = {
                 "model_state_dict": self.alg.actor_critic_1.state_dict(),
+                "model_state_dict_1": self.alg.actor_critic_1.state_dict(),
+                "model_state_dict_2": self.alg.actor_critic_2.state_dict(),
                 "optimizer_state_dict": self.alg.optimizer_1.state_dict(),
+                "optimizer_state_dict_1": self.alg.optimizer_1.state_dict(),
+                "optimizer_state_dict_2": self.alg.optimizer_2.state_dict(),
+                "algorithm_class_name": self.alg.__class__.__name__,
                 "iter": self.current_learning_iteration,
                 "infos": infos,
             }
@@ -347,6 +437,7 @@ class OnPolicyRunner:
             saved_dict = {
                 "model_state_dict": self.alg.actor_critic.state_dict(),
                 "optimizer_state_dict": self.alg.optimizer.state_dict(),
+                "algorithm_class_name": self.alg.__class__.__name__,
                 "iter": self.current_learning_iteration,
                 "infos": infos,
             }
@@ -362,14 +453,21 @@ class OnPolicyRunner:
         """Load a model checkpoint."""
         loaded_dict = torch.load(path, weights_only=True)
         if self.is_mdpo:
-            self.alg.actor_critic_1.load_state_dict(loaded_dict["model_state_dict"], strict=True)
-            self.alg.actor_critic_2.load_state_dict(loaded_dict["model_state_dict"], strict=True)
+            model_state_dict_1 = loaded_dict.get("model_state_dict_1", loaded_dict["model_state_dict"])
+            model_state_dict_2 = loaded_dict.get("model_state_dict_2", loaded_dict.get("model_state_dict_1", loaded_dict["model_state_dict"]))
+            self.alg.actor_critic_1.load_state_dict(model_state_dict_1, strict=True)
+            self.alg.actor_critic_2.load_state_dict(model_state_dict_2, strict=True)
             if load_optimizer:
-                self.alg.optimizer_1.load_state_dict(loaded_dict["optimizer_state_dict"])
+                optimizer_state_dict_1 = loaded_dict.get("optimizer_state_dict_1", loaded_dict["optimizer_state_dict"])
+                optimizer_state_dict_2 = loaded_dict.get("optimizer_state_dict_2", loaded_dict.get("optimizer_state_dict_1", loaded_dict["optimizer_state_dict"]))
+                self.alg.optimizer_1.load_state_dict(optimizer_state_dict_1)
+                self.alg.optimizer_2.load_state_dict(optimizer_state_dict_2)
         else:
-            self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"], strict=True)
+            model_state_dict = loaded_dict.get("model_state_dict_1", loaded_dict["model_state_dict"])
+            self.alg.actor_critic.load_state_dict(model_state_dict, strict=True)
             if load_optimizer:
-                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+                optimizer_state_dict = loaded_dict.get("optimizer_state_dict_1", loaded_dict["optimizer_state_dict"])
+                self.alg.optimizer.load_state_dict(optimizer_state_dict)
         if self.empirical_normalization:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
             self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
