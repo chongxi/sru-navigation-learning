@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 import rsl_rl
 from rsl_rl.algorithms import MDPO, PPO, SPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticSRU, EmpiricalNormalization
+from rsl_rl.modules import ActorCritic, ActorCriticPhasor, ActorCriticRecurrent, ActorCriticSRU, EmpiricalNormalization
 from rsl_rl.utils import store_code_state, VideoRecorder
 
 
@@ -99,6 +99,44 @@ class OnPolicyRunner:
         self._staggered_env_bucket_ids = torch.empty(0, dtype=torch.long, device=self.device)
         self._staggered_bucket_phases = torch.empty(0, dtype=torch.long, device=self.device)
         self._staggered_max_rollout_phases = 0
+        self._maybe_compile_policy()
+
+    def _maybe_compile_actor_critic(self, actor_critic):
+        """Compile supported actor-critic hot paths when requested."""
+        if not self.cfg.get("torch_compile_policy", False):
+            return
+        if not hasattr(torch, "compile"):
+            print("[WARN] torch.compile is unavailable in this PyTorch build; skipping policy compilation.")
+            return
+        mode = self.cfg.get("torch_compile_mode", "default")
+        compile_kwargs = {}
+        if mode and mode != "default":
+            compile_kwargs["mode"] = mode
+        try:
+            if isinstance(actor_critic, ActorCriticSRU):
+                actor_critic._compute_action_mean = torch.compile(actor_critic._compute_action_mean, **compile_kwargs)
+                actor_critic._compute_value = torch.compile(actor_critic._compute_value, **compile_kwargs)
+            elif hasattr(actor_critic, "update_distribution"):
+                actor_critic.update_distribution = torch.compile(actor_critic.update_distribution, **compile_kwargs)
+                if hasattr(actor_critic, "evaluate"):
+                    actor_critic.evaluate = torch.compile(actor_critic.evaluate, **compile_kwargs)
+            print(
+                f"[INFO] torch.compile enabled for {actor_critic.__class__.__name__}"
+                f" (mode={mode})"
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] torch.compile failed for {actor_critic.__class__.__name__}: {exc}."
+                " Continuing without compilation."
+            )
+
+    def _maybe_compile_policy(self):
+        """Compile supported policy hot paths for the current algorithm."""
+        if self.is_mdpo:
+            self._maybe_compile_actor_critic(self.alg.actor_critic_1)
+            self._maybe_compile_actor_critic(self.alg.actor_critic_2)
+        else:
+            self._maybe_compile_actor_critic(self.alg.actor_critic)
 
     def _reset_policy_memories(self, dones: torch.Tensor):
         """Reset recurrent policy memory for envs that ended during warm-up."""
@@ -131,14 +169,15 @@ class OnPolicyRunner:
             return torch.empty(0, dtype=torch.long, device=self.device)
         return (self._staggered_env_bucket_ids == bucket_idx).nonzero(as_tuple=False).squeeze(-1)
 
-    def _apply_staggered_reset_gate(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply the next reset gate and return fresh normalized observations."""
+    def _apply_staggered_reset_gate(self) -> tuple[torch.Tensor, torch.Tensor, dict | None]:
+        """Apply the next reset gate and return fresh normalized observations and gate logs."""
         if self._staggered_bucket_phases.numel() == 0:
             obs, extras = self.env.get_observations()
-            return self._compute_normalized_observations(obs, extras)
+            return (*self._compute_normalized_observations(obs, extras), None)
 
         self._staggered_bucket_phases += 1
         due_bucket_ids = (self._staggered_bucket_phases >= self._staggered_max_rollout_phases).nonzero(as_tuple=False).squeeze(-1)
+        gate_log = None
         for bucket_idx in due_bucket_ids.tolist():
             gate_env_ids = self._bucket_env_ids(bucket_idx)
             reset_env_ids = self.env.unwrapped.apply_staggered_reset_gate(gate_env_ids)
@@ -147,10 +186,13 @@ class OnPolicyRunner:
                 manual_dones = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
                 manual_dones[reset_env_ids] = 1
                 self._reset_policy_memories(manual_dones)
+                if "log" in self.env.unwrapped.extras and self.env.unwrapped.extras["log"]:
+                    gate_log = dict(self.env.unwrapped.extras["log"])
+                    self.env.unwrapped.extras["log"] = dict()
             self._staggered_bucket_phases[bucket_idx] = 0
 
         obs, extras = self.env.get_observations()
-        return self._compute_normalized_observations(obs, extras)
+        return (*self._compute_normalized_observations(obs, extras), gate_log)
 
     def _compute_normalized_observations(
         self, obs: torch.Tensor, extras: dict
@@ -330,9 +372,9 @@ class OnPolicyRunner:
                     self.alg.process_env_step(rewards, dones, infos)
 
                     if self.log_dir is not None:
-                        if "episode" in infos:
+                        if "episode" in infos and infos["episode"]:
                             ep_infos.append(infos["episode"])
-                        elif "log" in infos:
+                        elif "log" in infos and infos["log"]:
                             ep_infos.append(infos["log"])
 
                         # Shift rewards back for logging
@@ -352,7 +394,9 @@ class OnPolicyRunner:
                 collection_time = stop - start
 
                 if self._staggered_bucket_phases.numel() > 0:
-                    obs, critic_obs = self._apply_staggered_reset_gate()
+                    obs, critic_obs, gate_log = self._apply_staggered_reset_gate()
+                    if self.log_dir is not None and gate_log:
+                        ep_infos.append(gate_log)
                     stop = time.time()
                     collection_time = stop - start
 
@@ -366,9 +410,17 @@ class OnPolicyRunner:
             # Update returns different values based on algorithm type
             update_result = self.alg.update(it, tot_iter)
             if self.is_mdpo:
-                mean_value_loss, mean_surrogate_loss, mean_kl_divergence = update_result
+                if len(update_result) == 4:
+                    mean_value_loss, mean_surrogate_loss, mean_kl_divergence, mean_entropy = update_result
+                else:
+                    mean_value_loss, mean_surrogate_loss, mean_kl_divergence = update_result
+                    mean_entropy = None
             else:
-                mean_value_loss, mean_surrogate_loss = update_result
+                if len(update_result) == 3:
+                    mean_value_loss, mean_surrogate_loss, mean_entropy = update_result
+                else:
+                    mean_value_loss, mean_surrogate_loss = update_result
+                    mean_entropy = None
                 mean_kl_divergence = None
 
             stop = time.time()
@@ -404,7 +456,10 @@ class OnPolicyRunner:
 
         ep_string = ""
         if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
+            ep_info_keys = set()
+            for ep_info in locs["ep_infos"]:
+                ep_info_keys.update(ep_info.keys())
+            for key in sorted(ep_info_keys):
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
                     if key not in ep_info:
@@ -424,9 +479,14 @@ class OnPolicyRunner:
 
         # Get action std from appropriate actor-critic
         if self.is_mdpo:
-            mean_std = self.alg.actor_critic_1.action_std.mean()
+            action_std = self.alg.actor_critic_1.action_std
         else:
-            mean_std = self.alg.actor_critic.action_std.mean()
+            action_std = self.alg.actor_critic.action_std
+        if action_std.ndim == 1:
+            per_action_std = action_std
+        else:
+            per_action_std = action_std.reshape(-1, action_std.shape[-1]).mean(dim=0)
+        mean_std = per_action_std.mean()
 
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
@@ -434,8 +494,15 @@ class OnPolicyRunner:
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         if self.is_mdpo and locs["mean_kl_divergence"] is not None:
             self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
+        if locs.get("mean_entropy") is not None:
+            self.writer.add_scalar("Loss/entropy", locs["mean_entropy"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        for action_idx, std in enumerate(per_action_std):
+            self.writer.add_scalar(f"Policy/noise_std_action_{action_idx}", std.item(), locs["it"])
+        if per_action_std.numel() >= 2:
+            self.writer.add_scalar("Policy/noise_std_vx", per_action_std[0].item(), locs["it"])
+            self.writer.add_scalar("Policy/noise_std_steering", per_action_std[1].item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
@@ -460,11 +527,15 @@ class OnPolicyRunner:
             )
             if self.is_mdpo and locs["mean_kl_divergence"] is not None:
                 log_string += f"""{'KL divergence:':>{pad}} {locs['mean_kl_divergence']:.4f}\n"""
+            if locs.get("mean_entropy") is not None:
+                log_string += f"""{'Entropy:':>{pad}} {locs['mean_entropy']:.4f}\n"""
             log_string += (
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
             )
+            if per_action_std.numel() >= 2:
+                log_string += f"""{'Action noise std [vx, steering]:':>{pad}} [{per_action_std[0].item():.2f}, {per_action_std[1].item():.2f}]\n"""
         else:
             log_string = (
                 f"""{'#' * width}\n"""
@@ -474,6 +545,10 @@ class OnPolicyRunner:
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
+            if per_action_std.numel() >= 2:
+                log_string += f"""{'Action noise std [vx, steering]:':>{pad}} [{per_action_std[0].item():.2f}, {per_action_std[1].item():.2f}]\n"""
+            if locs.get("mean_entropy") is not None:
+                log_string += f"""{'Entropy:':>{pad}} {locs['mean_entropy']:.4f}\n"""
 
         log_string += ep_string
         log_string += (

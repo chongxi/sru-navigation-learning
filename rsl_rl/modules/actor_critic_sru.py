@@ -361,11 +361,30 @@ class ActorCriticSRU(nn.Module):
         std = self.log_std.exp().expand_as(mean)
         self.distribution = Normal(mean, std)
 
-    def act(self, observations, masks=None, hidden_states=None, dropout_masks=None):
-        """Sample actions from the policy."""
+    def _compute_action_mean(self, observations, masks=None, hidden_states=None, dropout_masks=None):
+        """Compute action mean before distribution sampling.
+
+        This isolates the hot actor path so it can be wrapped by torch.compile
+        without compiling the Normal distribution object construction.
+        """
         combined_features = self.process_actor_input(observations, masks, hidden_states)
         combined_features = self.linear_dropout_actor(combined_features, dropout_masks)
-        self.update_distribution(combined_features)
+        return self.actor(combined_features)
+
+    def _compute_value(self, critic_observations, masks=None, hidden_states=None, dropout_masks=None):
+        """Compute critic value from observations.
+
+        This isolates the hot critic path so it can be wrapped by torch.compile.
+        """
+        combined_features = self.process_critic_input(critic_observations, masks, hidden_states)
+        combined_features = self.linear_dropout_critic(combined_features, dropout_masks)
+        return self.critic(combined_features)
+
+    def act(self, observations, masks=None, hidden_states=None, dropout_masks=None):
+        """Sample actions from the policy."""
+        mean = self._compute_action_mean(observations, masks, hidden_states, dropout_masks)
+        std = self.log_std.exp().expand_as(mean)
+        self.distribution = Normal(mean, std)
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
@@ -374,17 +393,11 @@ class ActorCriticSRU(nn.Module):
 
     def act_inference(self, observations, masks=None, hidden_states=None, dropout_masks=None):
         """Get deterministic actions for inference."""
-        combined_features = self.process_actor_input(observations, masks, hidden_states)
-        combined_features = self.linear_dropout_actor(combined_features, dropout_masks)
-        actions_mean = self.actor(combined_features)
-        return actions_mean
+        return self._compute_action_mean(observations, masks, hidden_states, dropout_masks)
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None, dropout_masks=None):
         """Evaluate state values."""
-        combined_features = self.process_critic_input(critic_observations, masks, hidden_states)
-        combined_features = self.linear_dropout_critic(combined_features, dropout_masks)
-        value = self.critic(combined_features)
-        return value
+        return self._compute_value(critic_observations, masks, hidden_states, dropout_masks)
 
     def get_hidden_states(self):
         """Get current hidden states from actor and critic memories."""
@@ -736,6 +749,8 @@ def get_activation(act_name: str) -> nn.Module:
         return nn.ReLU(inplace=True)
     elif act_name == "lrelu":
         return nn.LeakyReLU(inplace=True)
+    elif act_name == "gelu":
+        return nn.GELU()
     elif act_name == "tanh":
         return nn.Tanh()
     elif act_name == "sigmoid":

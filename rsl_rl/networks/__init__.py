@@ -4,6 +4,11 @@
 
 """Network architectures for RL-agents."""
 
+from .phasor_backbone import (
+    DepthVerticalPool,
+    NavigationPhasorBackbone,
+    circular_corr_fft,
+)
 from .sru_memory import (
     LSTM_SRU,
     LSTMSRUCell,
@@ -11,6 +16,9 @@ from .sru_memory import (
 )
 
 __all__ = [
+    "DepthVerticalPool",
+    "NavigationPhasorBackbone",
+    "circular_corr_fft",
     "LSTM_SRU",
     "LSTMSRUCell",
     "CrossAttentionFuseModule",

@@ -446,11 +446,12 @@ class MDPO:
         """Perform policy update with mutual distillation.
 
         Returns:
-            Tuple of (mean_value_loss, mean_surrogate_loss, mean_kl_divergence).
+            Tuple of (mean_value_loss, mean_surrogate_loss, mean_kl_divergence, mean_entropy).
         """
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_kl_divergence = 0.0
+        mean_entropy = 0.0
 
         # Update learning rate
         self._update_learning_rate(iteration, max_iterations)
@@ -574,14 +575,19 @@ class MDPO:
             mean_value_loss += (value_loss_1.item() + value_loss_2.item()) * 0.5
             mean_surrogate_loss += (surrogate_loss_1.item() + surrogate_loss_2.item()) * 0.5
             mean_kl_divergence += (distill_kl_1.item() + distill_kl_2.item()) * 0.5
+            mean_entropy += (
+                _masked_mean(entropy_batch_1, valid_mask_batch_1).item()
+                + _masked_mean(entropy_batch_2, valid_mask_batch_2).item()
+            ) * 0.5
 
         # Average over all mini-batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_kl_divergence /= num_updates
+        mean_entropy /= num_updates
 
         # Clear rollouts
         self.storage_1.clear()
         self.storage_2.clear()
 
-        return mean_value_loss, mean_surrogate_loss, mean_kl_divergence
+        return mean_value_loss, mean_surrogate_loss, mean_kl_divergence, mean_entropy
